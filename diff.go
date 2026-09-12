@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"sync"
 	"time"
 )
 
@@ -49,27 +52,84 @@ func remoteNow() string {
 	return time.Now().UTC().Format(time.RFC3339)
 }
 
-// computeLocalHashes hashes all local files (computing SHA-256).
-func (c *Config) localIndex() (map[string]*LocalFile, error) {
+// localIndex lists all local files and computes SHA-256 hashes. When state is
+// non-nil, files whose size and mtime are unchanged since the last sync reuse
+// their cached hash instead of re-reading the whole content — the same
+// size+mtime fast path rsync uses. Only changed/new files are hashed, in
+// parallel.
+func (c *Config) localIndex(state *State) (map[string]*LocalFile, error) {
 	files, err := c.WalkLocal()
 	if err != nil {
 		return nil, err
 	}
-	idx := map[string]*LocalFile{}
+	idx := make(map[string]*LocalFile, len(files))
+	toHash := make([]*LocalFile, 0, len(files))
 	for _, f := range files {
-		h, err := HashFile(f.AbsPath)
-		if err != nil {
-			return nil, err
-		}
-		f.Hash = h
 		idx[f.RelPath] = f
+		if state != nil {
+			if sf, ok := state.Files[f.RelPath]; ok && sf.LocalHash != "" &&
+				sf.LocalSize == f.Size && sf.LocalMtime == f.Mtime {
+				f.Hash = sf.LocalHash
+				continue
+			}
+		}
+		toHash = append(toHash, f)
+	}
+	if err := hashConcurrent(toHash); err != nil {
+		return nil, err
 	}
 	return idx, nil
 }
 
+// hashConcurrent hashes files with a bounded worker pool (max 8). Each worker
+// reuses one read buffer so memory stays flat regardless of file count.
+func hashConcurrent(files []*LocalFile) error {
+	if len(files) == 0 {
+		return nil
+	}
+	workers := runtime.NumCPU()
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 2 {
+		workers = 2
+	}
+	jobs := make(chan *LocalFile, workers)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var fatal bool
+	worker := func() {
+		defer wg.Done()
+		buf := make([]byte, hashBufSize)
+		for f := range jobs {
+			h, err := hashFileBuffer(f.AbsPath, buf)
+			if err != nil {
+				mu.Lock()
+				fatal = true
+				mu.Unlock()
+				return
+			}
+			f.Hash = h
+		}
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	for _, f := range files {
+		jobs <- f
+	}
+	close(jobs)
+	wg.Wait()
+	if fatal {
+		return fmt.Errorf("gagal menghitung hash file")
+	}
+	return nil
+}
+
 // status builds the full diff summary.
 func (c *Config) diff(client *DeployClient, state *State) (*Diff, error) {
-	locIdx, err := c.localIndex()
+	locIdx, err := c.localIndex(state)
 	if err != nil {
 		return nil, err
 	}
@@ -150,11 +210,7 @@ func computeConflicts(d *Diff) {
 }
 
 func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
+	slices.Sort(s)
 }
 
 type Diff struct {

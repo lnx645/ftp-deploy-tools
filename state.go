@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -16,9 +16,11 @@ type RemoteMeta struct {
 }
 
 type StateFile struct {
-	LocalHash  string     `json:"localHash"`
-	RemoteSize int64      `json:"remoteSize,omitempty"`
-	RemoteTime string     `json:"remoteTime,omitempty"`
+	LocalHash   string `json:"localHash"`
+	LocalSize   int64  `json:"localSize,omitempty"`
+	LocalMtime  int64  `json:"localMtime,omitempty"`
+	RemoteSize  int64  `json:"remoteSize,omitempty"`
+	RemoteTime  string `json:"remoteTime,omitempty"`
 }
 
 type State struct {
@@ -67,24 +69,24 @@ func (s *State) Save(localDir string) error {
 	return os.WriteFile(statePath(localDir), data, 0o600)
 }
 
+// hashBufSize is the read buffer used per hashing worker (shared between files).
+const hashBufSize = 1 << 20
+
 func HashFile(path string) (string, error) {
+	return hashFileBuffer(path, make([]byte, hashBufSize))
+}
+
+// hashFileBuffer hashes a file with a caller-owned buffer, so concurrent
+// workers reuse one allocation instead of allocating 1 MiB per file.
+func hashFileBuffer(path string, buf []byte) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := copyBuffer(h, f); err != nil {
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// keyForState is a stable key used to derive a short fingerprint.
-func keyForState(sf StateFile) uint32 {
-	h := fnv.New32a()
-	h.Write([]byte(sf.LocalHash))
-	h.Write([]byte(fmt.Sprintf("|%d", sf.RemoteSize)))
-	h.Write([]byte(sf.RemoteTime))
-	return h.Sum32()
 }

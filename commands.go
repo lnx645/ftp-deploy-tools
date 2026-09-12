@@ -3,17 +3,19 @@ package main
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
 func runInit(cfg *Config, client *DeployClient, deleteRemote bool) error {
 	fmt.Println("=== INIT: full sync local -> server ===")
-	locIdx, err := cfg.localIndex()
+	state := &State{Version: 1, Files: map[string]StateFile{}}
+	locIdx, err := cfg.localIndex(state)
 	if err != nil {
 		return err
 	}
-	state := &State{Version: 1, Files: map[string]StateFile{}}
 
 	var uploaded int
 	var deleted int
@@ -27,7 +29,11 @@ func runInit(cfg *Config, client *DeployClient, deleteRemote bool) error {
 		}
 		uploaded++
 		bytes += lf.Size
-		state.Files[lf.RelPath] = StateFile{LocalHash: lf.Hash}
+		state.Files[lf.RelPath] = StateFile{
+			LocalHash:  lf.Hash,
+			LocalSize:  lf.Size,
+			LocalMtime: lf.Mtime,
+		}
 		uploadedRels[lf.RelPath] = true
 		fmt.Printf("  [U] %s\n", lf.RelPath)
 	}
@@ -63,13 +69,28 @@ func runInit(cfg *Config, client *DeployClient, deleteRemote bool) error {
 	return nil
 }
 
+// remoteMetaLister lets syncRemoteMeta capture post-upload meta without a
+// full-tree re-walk; *DeployClient implements it.
+type remoteMetaLister interface {
+	ListRemoteDirs(dirs []string) ([]*RemoteFile, error)
+}
+
 // syncRemoteMeta records remote size/time for freshly uploaded files so the
-// next diff does not mistake them for "changed on server".
-func syncRemoteMeta(client *DeployClient, state *State, rels map[string]bool) error {
+// next diff does not mistake them for "changed on server". Instead of
+// re-listing the whole tree, it lists only the directories that were touched.
+func syncRemoteMeta(client remoteMetaLister, state *State, rels map[string]bool) error {
 	if len(rels) == 0 {
 		return nil
 	}
-	remotes, err := client.ListRemote()
+	dirs := map[string]bool{}
+	for rel := range rels {
+		dirs[path.Dir(rel)] = true
+	}
+	dirList := make([]string, 0, len(dirs))
+	for d := range dirs {
+		dirList = append(dirList, d)
+	}
+	remotes, err := client.ListRemoteDirs(dirList)
 	if err != nil {
 		return err
 	}
@@ -89,19 +110,11 @@ func syncRemoteMeta(client *DeployClient, state *State, rels map[string]bool) er
 }
 
 func sortedLocal(idx map[string]*LocalFile) []*LocalFile {
-	keys := make([]string, 0, len(idx))
-	for k := range idx {
-		keys = append(keys, k)
+	out := make([]*LocalFile, 0, len(idx))
+	for _, f := range idx {
+		out = append(out, f)
 	}
-	for i := 1; i < len(keys); i++ {
-		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
-			keys[j], keys[j-1] = keys[j-1], keys[j]
-		}
-	}
-	out := make([]*LocalFile, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, idx[k])
-	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RelPath < out[j].RelPath })
 	return out
 }
 
@@ -145,8 +158,7 @@ func runPush(cfg *Config, client *DeployClient, deleteRemote bool, dryRun bool, 
 		if err := client.Upload(lf.AbsPath, rel); err != nil {
 			return err
 		}
-		hash, _ := HashFile(lf.AbsPath)
-		state.Files[rel] = StateFile{LocalHash: hash}
+		state.Files[rel] = StateFile{LocalHash: lf.Hash, LocalSize: lf.Size, LocalMtime: lf.Mtime}
 		uploaded++
 		bytes += lf.Size
 		uploadedRels[rel] = true
@@ -161,8 +173,7 @@ func runPush(cfg *Config, client *DeployClient, deleteRemote bool, dryRun bool, 
 		if err := client.Upload(lf.AbsPath, rel); err != nil {
 			return err
 		}
-		hash, _ := HashFile(lf.AbsPath)
-		state.Files[rel] = StateFile{LocalHash: hash}
+		state.Files[rel] = StateFile{LocalHash: lf.Hash, LocalSize: lf.Size, LocalMtime: lf.Mtime}
 		uploaded++
 		bytes += lf.Size
 		uploadedRels[rel] = true
@@ -243,12 +254,18 @@ func runPull(cfg *Config, client *DeployClient, deleteLocal bool, dryRun bool) e
 			return err
 		}
 		hash, _ := HashFile(localAbs)
+		st, _ := os.Stat(localAbs)
 		rf := d.Remote[rel]
-		state.Files[rel] = StateFile{
+		sf := StateFile{
 			LocalHash:  hash,
 			RemoteSize: rf.Size,
 			RemoteTime: rf.Time.UTC().Format("2006-01-02T15:04:05Z"),
 		}
+		if st != nil {
+			sf.LocalSize = st.Size()
+			sf.LocalMtime = st.ModTime().UnixNano()
+		}
+		state.Files[rel] = sf
 		downloaded++
 		bytes += rf.Size
 		fmt.Printf("  [D] %s\n", rel)
@@ -256,8 +273,7 @@ func runPull(cfg *Config, client *DeployClient, deleteLocal bool, dryRun bool) e
 
 	// Files that exist locally but no longer on server.
 	if deleteLocal {
-		locIdx, _ := cfg.localIndex()
-		for _, lf := range sortedLocal(locIdx) {
+		for _, lf := range sortedLocal(d.Local) {
 			if _, ok := d.Remote[lf.RelPath]; !ok {
 				if _, inState := state.Files[lf.RelPath]; inState {
 					if err := os.Remove(lf.AbsPath); err != nil {

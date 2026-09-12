@@ -115,9 +115,49 @@ func (c *DeployClient) walkRemote(dir, prefix string, out *[]*RemoteFile) error 
 	return nil
 }
 
-var createdDirs = map[string]bool{}
+// ListRemoteDirs lists files (non-recursive) under the given relative
+// directories. Used right after an upload to capture the server's size/mtime
+// without re-walking the whole tree.
+func (c *DeployClient) ListRemoteDirs(dirs []string) ([]*RemoteFile, error) {
+	var out []*RemoteFile
+	seen := map[string]bool{}
+	for _, dir := range dirs {
+		dir = strings.Trim(dir, "/")
+		if dir == "." {
+			dir = ""
+		}
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		entries, err := c.conn.List(c.remoteAbs(dir))
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			if e.Type == ftp.EntryTypeFolder {
+				continue
+			}
+			rel := e.Name
+			if dir != "" {
+				rel = dir + "/" + e.Name
+			}
+			if c.cfg.IsIgnored(rel) {
+				continue
+			}
+			t := e.Time
+			if t.IsZero() {
+				t = time.Now()
+			}
+			out = append(out, &RemoteFile{RelPath: rel, Size: int64(e.Size), Time: t})
+		}
+	}
+	return out, nil
+}
 
 // EnsureRemoteDir creates remote directories for the parent of relPath.
+var createdDirs = map[string]bool{}
+
 func (c *DeployClient) EnsureRemoteDir(rel string) error {
 	dirs := strings.Split(path.Dir(rel), "/")
 	cur := c.cfg.RemoteDir

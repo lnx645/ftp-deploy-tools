@@ -204,6 +204,7 @@ type LocalFile struct {
 	RelPath string
 	AbsPath string
 	Size    int64
+	Mtime   int64
 	Hash    string
 }
 
@@ -260,6 +261,7 @@ func (c *Config) walkLocal(dir, rel string, files *[]*LocalFile) error {
 			RelPath: filepath.ToSlash(childRel),
 			AbsPath: full,
 			Size:    info.Size(),
+			Mtime:   info.ModTime().UnixNano(),
 		})
 	}
 	return nil
