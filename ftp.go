@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jlaffaye/ftp"
+	"github.com/schollz/progressbar/v3"
+	"golang.org/x/term"
 )
 
 type DeployClient struct {
@@ -93,6 +95,10 @@ func (c *DeployClient) walkRemote(dir, prefix string, out *[]*RemoteFile) error 
 		if prefix != "" {
 			rel = prefix + "/" + name
 		}
+		// Ignore patterns apply on both sides (git-like).
+		if c.cfg.IsIgnored(rel) {
+			continue
+		}
 		switch e.Type {
 		case ftp.EntryTypeFolder:
 			if err := c.walkRemote(c.remoteAbs(rel), rel, out); err != nil {
@@ -142,7 +148,42 @@ func (c *DeployClient) EnsureRemoteDir(rel string) error {
 	return nil
 }
 
-// Upload copies a local file to the remote tree.
+// progressActive diset saat stderr adalah terminal interaktif (TTY).
+// Jika bukan TTY (pipe, CI, log) bar disembunyikan agar output tetap bersih.
+var progressActive = term.IsTerminal(int(os.Stderr.Fd()))
+
+// newFileBar builds a per-file progress bar that reports bytes in human
+// units (MB) + percent; total<=0 renders an indeterminate spinner.
+func newFileBar(desc string, total int64) *progressbar.ProgressBar {
+	opts := []progressbar.Option{
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetDescription("  " + desc),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionThrottle(80 * time.Millisecond),
+	}
+	if total > 0 {
+		return progressbar.NewOptions64(total, opts...)
+	}
+	return progressbar.NewOptions(-1, opts...)
+}
+
+// progressReader advances the bar for every chunk read from the underlying
+// stream, so Stor/Retr drive the progress automatically.
+type progressReader struct {
+	r   io.Reader
+	bar *progressbar.ProgressBar
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		_ = p.bar.Add(n)
+	}
+	return n, err
+}
+
+// Upload copies a local file to the remote tree (with progress).
 func (c *DeployClient) Upload(localAbs, rel string) error {
 	if err := c.EnsureRemoteDir(rel); err != nil {
 		return err
@@ -152,10 +193,21 @@ func (c *DeployClient) Upload(localAbs, rel string) error {
 		return err
 	}
 	defer f.Close()
-	return c.conn.Stor(c.remoteAbs(rel), f)
+
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	if !progressActive {
+		return c.conn.Stor(c.remoteAbs(rel), f)
+	}
+	bar := newFileBar("UP "+rel, st.Size())
+	defer bar.Finish()
+	return c.conn.Stor(c.remoteAbs(rel), &progressReader{r: f, bar: bar})
 }
 
-// Download fetches a remote file to a local path.
+// Download fetches a remote file to a local path (with progress).
 func (c *DeployClient) Download(remoteRel, localAbs string) error {
 	os.MkdirAll(path.Dir(localAbs), 0o755)
 	resp, err := c.conn.Retr(c.remoteAbs(remoteRel))
@@ -168,7 +220,20 @@ func (c *DeployClient) Download(remoteRel, localAbs string) error {
 		return err
 	}
 	defer out.Close()
-	_, err = io.Copy(out, resp)
+
+	if !progressActive {
+		_, err = io.Copy(out, resp)
+		return err
+	}
+	// FileSize needs its own data connection, so fetch it before Retr's is
+	// consumed; -1 means the server did not answer (indeterminate bar).
+	size, err := c.conn.FileSize(c.remoteAbs(remoteRel))
+	if err != nil {
+		size = -1
+	}
+	bar := newFileBar("DL "+remoteRel, size)
+	defer bar.Finish()
+	_, err = io.Copy(out, &progressReader{r: resp, bar: bar})
 	return err
 }
 

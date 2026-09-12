@@ -74,7 +74,8 @@ func runInitConfig(localDir string) error {
 		return fmt.Errorf("simpan config gagal: %w", err)
 	}
 	fmt.Println("Config tersimpan di .ftpdeploy/config.json")
-	fmt.Println("Tips: bisa override password via env FTPDEPLOY_PASSWORD")
+	fmt.Println("Keamanan: password dienkripsi DPAPI (user+machine Windows) — sama seperti Git Credential Manager.")
+	fmt.Println("Tips: override password via env FTPDEPLOY_PASSWORD jika perlu.")
 	return nil
 }
 

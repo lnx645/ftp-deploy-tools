@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,6 +9,32 @@ import (
 	"sort"
 	"strings"
 )
+
+// encPrefix marks a password field that was encrypted with DPAPI.
+const encPrefix = "enc:"
+
+func encryptSecret(plain string) (string, error) {
+	blob, err := ProtectSecret([]byte(plain))
+	if err != nil {
+		return "", err
+	}
+	return encPrefix + base64.StdEncoding.EncodeToString(blob), nil
+}
+
+func decryptSecret(stored string) (string, error) {
+	if !strings.HasPrefix(stored, encPrefix) {
+		return stored, nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, encPrefix))
+	if err != nil {
+		return "", err
+	}
+	blob, err := UnprotectSecret(raw)
+	if err != nil {
+		return "", err
+	}
+	return string(blob), nil
+}
 
 type Config struct {
 	Host        string   `json:"host"`
@@ -66,6 +93,14 @@ func LoadConfig(localDir string) (*Config, error) {
 	if cfg.RemoteDir == "" {
 		cfg.RemoteDir = "/"
 	}
+	// Decrypt an encrypted password (enc:...) back to plain for use in memory.
+	if cfg.Password != "" {
+		pw, derr := decryptSecret(cfg.Password)
+		if derr != nil {
+			return nil, fmt.Errorf("password terenkripsi tidak bisa dibuka (bukan user/machine yang sama?): %w", derr)
+		}
+		cfg.Password = pw
+	}
 	// Always protect these paths regardless of user config.
 	reserved := []string{".git/**", ".ftpdeploy/**", ".env", ".env.*"}
 	for _, r := range reserved {
@@ -93,7 +128,18 @@ func SaveConfig(cfg *Config) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	copy := *cfg
+	// Encrypt the password before writing it to disk.
+	if copy.Password != "" && !strings.HasPrefix(copy.Password, encPrefix) {
+		enc, err := encryptSecret(copy.Password)
+		if err != nil {
+			// DPAPI unavailable: persist plain (non-Windows fallback) but note it.
+			fmt.Printf("Peringatan: password tidak terenkripsi (%v)\n", err)
+		} else {
+			copy.Password = enc
+		}
+	}
+	data, err := json.MarshalIndent(copy, "", "  ")
 	if err != nil {
 		return err
 	}

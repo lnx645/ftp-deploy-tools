@@ -75,10 +75,13 @@ func main() {
 			fmt.Printf("Config belum ada: %v\n", err)
 			os.Exit(1)
 		}
+		stored, _ := os.ReadFile(configPath(localDir))
+		enc := strings.Contains(string(stored), "\"password\": \"enc:")
 		fmt.Printf("Host:     %s:%d\n", cfg.Host, cfg.Port)
 		fmt.Printf("User:     %s\n", cfg.Username)
 		fmt.Printf("Remote:   %s\n", cfg.RemoteDir)
 		fmt.Printf("Local:    %s\n", cfg.LocalDir)
+		fmt.Printf("Password: %s\n", map[bool]string{true: "encrypted (DPAPI)", false: "PLAIN (segera enkripsi via ftpd init-config)"}[enc])
 		fmt.Printf("Ignore:   %d pola\n", len(cfg.Ignore))
 		return
 	case "init-config":
